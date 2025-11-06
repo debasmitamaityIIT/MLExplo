@@ -1,81 +1,76 @@
 import numpy as np
 import pandas as pd
-from scipy.io import loadmat
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.model_selection import train_test_split
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
+import scipy.io as sio
 import matplotlib.pyplot as plt
-import glob
-import os
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
 
+# === STEP 1: Load the -10°C .mat file ===
+mat_data = sio.loadmat("06-08-17_10.21 3740_Charge1a.mat")
 
-base_path = "./battery_data/Panasonic 18650PF Data/-10degC"   # adjust if needed
-mat_files = glob.glob(os.path.join(base_path, "*.mat"))
-print("Files found:", len(mat_files))
+# Explore structure
+print(mat_data.keys())
 
+# === STEP 2: Extract important arrays ===
+# NASA datasets usually store these under:
+# 'meas' -> 'Voltage_measured', 'Current_measured', 'Temperature_measured', 'Time'
+data = mat_data['meas']
 
-voltage, current, temp = [], [], []
+voltage = data['Voltage_measured'][0,0].flatten()
+current = data['Current_measured'][0,0].flatten()
+temp = data['Temperature_measured'][0,0].flatten()
+time = data['Time'][0,0].flatten()
 
-for f in mat_files:
-    data = loadmat(f)
-    # typical NASA Panasonic .mat structure: data['data'][0,0]
-    try:
-        d = data['data'][0,0]
-        voltage.extend(d['Voltage_measured'][0])
-        current.extend(d['Current_measured'][0])
-        temp.extend(d['Temperature_measured'][0])
-    except KeyError:
-        print(f"⚠️ Could not read {f}")
+# === STEP 3: Compute Heat Generation (Simplified Q = I * (V - Voc_est)) ===
+# If Voc is not directly available, approximate with rolling average voltage
+Voc_est = pd.Series(voltage).rolling(window=50, min_periods=1).mean()
+Q_gen = current * (voltage - Voc_est)
 
 df = pd.DataFrame({
-    'Voltage_measured': voltage,
-    'Current_measured': current,
-    'Temperature_measured': temp
+    'Voltage': voltage,
+    'Current': current,
+    'Temperature': temp,
+    'HeatGen': Q_gen
 })
 print(df.head())
 
+# === STEP 4: Prepare data for LSTM ===
+features = df[['Voltage', 'Current', 'Temperature']].values
+labels = df['HeatGen'].values.reshape(-1, 1)
 
-df['Heat'] = df['Current_measured'] * (df['Voltage_measured'] - df['Voltage_measured'].shift(1))
-df.dropna(inplace=True)
+scaler_x = MinMaxScaler()
+scaler_y = MinMaxScaler()
+features_scaled = scaler_x.fit_transform(features)
+labels_scaled = scaler_y.fit_transform(labels)
 
+# Create sequences
+seq_len = 20
+X, y = [], []
+for i in range(len(features_scaled) - seq_len):
+    X.append(features_scaled[i:i+seq_len])
+    y.append(labels_scaled[i+seq_len])
+X, y = np.array(X), np.array(y)
 
-features = ['Voltage_measured', 'Current_measured', 'Temperature_measured']
-X = df[features].values
-y = df['Heat'].values
-
-scaler = MinMaxScaler()
-X_scaled = scaler.fit_transform(X)
-
-def make_seq(X, y, step=15):
-    Xs, ys = [], []
-    for i in range(len(X)-step):
-        Xs.append(X[i:i+step])
-        ys.append(y[i+step])
-    return np.array(Xs), np.array(ys)
-
-X_seq, y_seq = make_seq(X_scaled, y)
-X_train, X_test, y_train, y_test = train_test_split(X_seq, y_seq, test_size=0.2, shuffle=False)
-
-
+# === STEP 5: Define and Train LSTM ===
 model = Sequential([
-    LSTM(64, input_shape=(X_train.shape[1], X_train.shape[2])),
-    Dropout(0.2),
+    LSTM(64, input_shape=(seq_len, 3), return_sequences=False),
     Dense(32, activation='relu'),
     Dense(1)
 ])
 model.compile(optimizer='adam', loss='mse')
+model.fit(X, y, epochs=15, batch_size=32, verbose=1)
 
-history = model.fit(X_train, y_train, epochs=20, batch_size=32, validation_split=0.2, verbose=1)
-
-
-y_pred = model.predict(X_test)
+# === STEP 6: Predict and plot ===
+y_pred_scaled = model.predict(X)
+y_pred = scaler_y.inverse_transform(y_pred_scaled)
+y_true = labels[seq_len:]
 
 plt.figure(figsize=(10,5))
-plt.plot(y_test[:300], label='Actual Heat')
-plt.plot(y_pred[:300], label='Predicted Heat')
-plt.xlabel('Time step')
-plt.ylabel('Heat generation (Q)')
-plt.title('LSTM Heat Generation Prediction (-10°C data)')
+plt.plot(y_true, label='True Heat Generation', linewidth=2)
+plt.plot(y_pred, label='Predicted Heat Generation', linestyle='dashed')
 plt.legend()
+plt.xlabel('Time step')
+plt.ylabel('Heat Generation (approx)')
+plt.title('LSTM Prediction vs True Heat Generation (-10°C)')
 plt.show()
